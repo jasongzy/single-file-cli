@@ -65,6 +65,7 @@ const OPTIONS_INFO = {
 	"browser-device-width": { description: "Width of the device viewport in pixels (default value is 360 when using --browser-mobile-emulation)", type: "number" },
 	"browser-device-height": { description: "Height of the device viewport in pixels (default value is 800 when using --browser-mobile-emulation)", type: "number" },
 	"browser-device-scale-factor": { description: "Scale factor of the device viewport (default value is 2 when using --browser-mobile-emulation)", type: "number" },
+	"console-messages-file": { description: "Path of the file where to save the console messages in JSON format", type: "string" },
 	"compress-CSS": { description: "Compress CSS stylesheets", type: "boolean" },
 	"compress-HTML": { description: "Compress HTML content", type: "boolean", defaultValue: true },
 	"crawl-links": { description: "Crawl and save pages found via inner links", type: "boolean" },
@@ -80,8 +81,8 @@ const OPTIONS_INFO = {
 	"crawl-rewrite-rule": { description: "Rewrite rule used to rewrite URLs of crawled pages", type: "string[]" },
 	"dump-content": { description: "Dump the content of the processed page in the console ('true' when running in Docker)", type: "boolean" },
 	"emulate-media-feature": { description: "Emulate a media feature. The syntax is <name>:<value>, e.g. \"prefers-color-scheme:dark\"", type: "string[]" },
-	"error-file": { description: "Path of the file where to save the error messages", type: "string" },
-	"error-traces-disabled": { description: "Remove error stack traces in the error messages", type: "boolean", defaultValue: true },
+	"errors-file": { description: "Path of the file where to save the error messages", type: "string", alias: "error-file" },
+	"errors-traces-disabled": { description: "Remove error stack traces in the error messages", type: "boolean", defaultValue: true, alias: "error-traces-disabled" },
 	"filename-template": { description: "Template used to generate the output filename (see help page of the extension for more info)", type: "string", defaultValue: "%if-empty<{page-title}|No title> ({date-locale} {time-locale}).{filename-extension}" },
 	"filename-conflict-action": { description: "Action when the filename is conflicting with existing one on the filesystem. The possible values are \"uniquify\" (default), \"overwrite\" and \"skip\"", type: "string", defaultValue: "uniquify" },
 	"filename-replacement-character": { description: "The character used for replacing invalid characters in filenames", type: "string", defaultValue: "_" },
@@ -197,6 +198,14 @@ async function getOptions() {
 		options.browserArgs = options.browserArguments;
 		delete options.browserArguments;
 	}
+	if (options.errorFile) {
+		options.errorsFile = options.errorFile;
+		delete options.errorFile;
+	}
+	if (options.errorTracesDisabled) {
+		options.errorsTracesDisabled = options.errorTracesDisabled;
+		delete options.errorTracesDisabled;
+	}
 	delete options.acceptHeaderFont;
 	delete options.acceptHeaderImage;
 	delete options.acceptHeaderStylesheet;
@@ -292,7 +301,11 @@ function parseArg(arg) {
 }
 
 function getOptionInfo(optionName) {
-	return OPTIONS_INFO[Object.keys(OPTIONS_INFO).find(keyName => keyName.toLowerCase() == optionName.toLowerCase())];
+	for (const keyName in OPTIONS_INFO) {
+		if (keyName.toLowerCase() == optionName.toLowerCase() || OPTIONS_INFO[keyName].alias == optionName.toLowerCase()) {
+			return OPTIONS_INFO[keyName];
+		}
+	}
 }
 
 function kebabToCamelCase(optionName) {
