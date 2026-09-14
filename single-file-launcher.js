@@ -21,21 +21,24 @@
  *   Source.
  */
 
-import { initialize } from "./single-file-cli-api.js";
-import { closeBrowser } from "./lib/browser.js";
+import { initialize, closeBrowser } from "./single-file-cli-api.js";
+import { createBrowserProfile, getChromiumOptions } from "./lib/chromium.js";
 import { Deno } from "./lib/deno-polyfill.js";
-import options from "./options.js";
+import { getOptions, applySettings, parseUrlsFile } from "./options.js";
 
-const { readTextFile, readFile, exit, addSignalListener } = Deno;
+const { readTextFile, readFile, exit, addSignalListener, build } = Deno;
+const QUIT_BROWSER_HINT = build.os == "darwin" ? " (Cmd+Q)" : "";
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const PDF_SIGNATURE = [0x25, 0x50, 0x44, 0x46, 0x2d];
 
 try {
 	addSignalListener("SIGTERM", closeBrowserAndExit);
-} catch (_error) {
+} catch {
 	// ignored
 }
 try {
 	addSignalListener("SIGINT", closeBrowserAndExit);
-} catch (_error) {
+} catch {
 	// ignored
 }
 
@@ -43,69 +46,55 @@ export { run };
 
 async function run() {
 	try {
+		const options = getOptions();
 		let urls;
 		if (options.settingsFile) {
-			const settings = JSON.parse(await Deno.readTextFile(options.settingsFile));
-			let profileName = options.settingsProfile || "default";
-			if (profileName == "default" || !settings.profiles[profileName]) {
-				profileName = "__Default_Settings__";
-			}
-			Object.assign(options, settings.profiles[profileName]);
-			delete options.settingsFile;
+			const settings = JSON.parse(await readTextFile(options.settingsFile));
+			applySettings(options, settings);
+		}
+		if (options.createBrowserProfile) {
+			await saveBrowserProfile(options);
+			exit(0);
 		}
 		if (options.urlsFile) {
-			urls = (await readTextFile(options.urlsFile)).split("\n");
+			urls = await getUrlsFile(options.urlsFile);
 		} else {
 			urls = [options.url];
-		}
-		if (options.browserCookies) {
-			const cookies = [];
-			for (const cookie of options.browserCookies) {
-				const [name, value, domain, path, expires, httpOnly, secure, sameSite, url] = cookie.split(",");
-				cookies.push({
-					name,
-					value,
-					url,
-					domain,
-					path,
-					secure: secure === "true",
-					httpOnly: httpOnly === "true",
-					sameSite,
-					expires: isNaN(Number(expires)) ? undefined : Number(expires)
-				});
-			}
-			options.browserCookies = cookies;
 		}
 		if (options.browserCookiesFile) {
 			const cookiesContent = await readTextFile(options.browserCookiesFile);
 			try {
 				options.browserCookies = JSON.parse(cookiesContent);
-			} catch (error) {
+			} catch {
 				options.browserCookies = parseCookies(cookiesContent);
 			}
 		}
-		if (options.httpHeaders) {
-			const headers = {};
-			for (const header of options.httpHeaders) {
-				const [name, value] = header.split("=");
-				headers[name] = value.trim();
-			}
-			options.httpHeaders = headers;
-		}
 		if (options.embeddedImage) {
 			options.embeddedImage = Array.from(await readFile(options.embeddedImage));
+			checkSignature(options.embeddedImage, PNG_SIGNATURE, "--embedded-image", "PNG");
 		}
 		if (options.embeddedPdf) {
 			options.embeddedPdf = Array.from(await readFile(options.embeddedPdf));
+			checkSignature(options.embeddedPdf, PDF_SIGNATURE, "--embedded-pdf", "PDF");
 		}
 		options.retrieveLinks = true;
 		const singlefile = await initialize(options);
 		await singlefile.capture(urls);
-		await singlefile.finish();
+		const errorCount = await singlefile.finish();
+		if (errorCount) {
+			exit(1);
+		}
 	} catch (error) {
 		console.error(error.message || error); // eslint-disable-line no-console
 		await closeBrowserAndExit(-1);
 	}
+}
+
+async function saveBrowserProfile(options) {
+	const profileDirectory = options.createBrowserProfile;
+	console.error(`Log in to the website in the browser window, then quit the browser${QUIT_BROWSER_HINT} to save the profile.`); // eslint-disable-line no-console
+	await createBrowserProfile(Object.assign(getChromiumOptions(options), { profile: profileDirectory, startUrl: options.url }));
+	console.error(`Profile saved, use it with --browser-profile ${JSON.stringify(profileDirectory)}.`); // eslint-disable-line no-console
 }
 
 function parseCookies(textValue) {
@@ -136,4 +125,16 @@ function parseCookies(textValue) {
 async function closeBrowserAndExit(code) {
 	await closeBrowser();
 	exit(code);
+}
+
+async function getUrlsFile(urlsFile) {
+	return parseUrlsFile(await readTextFile(urlsFile));
+}
+
+// the faces are read from the bytes the file starts with: a PDF whose header sits further in
+// is dropped by PDF readers, and a file that is not a PNG produces an image nothing can open
+function checkSignature(data, signature, optionName, formatName) {
+	if (signature.some((byte, index) => data[index] != byte)) {
+		throw new Error(optionName + " must be given a " + formatName + " file, and it must start with the " + formatName + " signature");
+	}
 }

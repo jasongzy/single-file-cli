@@ -1,0 +1,91 @@
+// Which directory the e2e tests spawn the CLI from decides what they actually prove. By default it
+// is the repository root, which runs the committed lib/ — a build of the *pinned npm release* of
+// single-file-core. So after fixing something in a local single-file-core checkout, a green suite
+// here says nothing about the fix: the tests never loaded that code.
+//
+// SINGLE_FILE_TARGET=dev points them at .dev/ instead, the tree build-dev.sh stages from
+// ../single-file-core. Same suite, same assertions, against the unreleased core:
+//
+//   ./build-dev.sh && npm run test:dev
+//
+// The missing-directory check is deliberately loud. A silent fallback to the repository root would
+// reintroduce exactly the failure this exists to prevent — tests passing against the wrong code.
+import { join, dirname, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import process from "node:process";
+
+const CORE_DIRECTORY_NAME = "single-file-core";
+// what a rebuild does not read cannot make the build stale
+const IGNORED_DIRECTORY_NAMES = ["node_modules", "test", "tmp", "dist", "doc"];
+
+const repositoryDirectory = join(dirname(fileURLToPath(import.meta.url)), "..");
+const useDevBuild = process.env.SINGLE_FILE_TARGET === "dev";
+// SINGLE_FILE_BROWSER_ENGINE=firefox runs the same suite through the BiDi client, the CLI reads it
+// as the default of --browser-engine; the checks that hold for one engine only say so by name
+const browserEngine = process.env.SINGLE_FILE_BROWSER_ENGINE || "chromium";
+const firefox = browserEngine === "firefox";
+const cliDirectory = useDevBuild ? join(repositoryDirectory, ".dev") : repositoryDirectory;
+
+if (useDevBuild) {
+	const bundlePath = join(cliDirectory, "lib", "single-file-bundle.js");
+	if (!existsSync(bundlePath)) {
+		throw new Error("SINGLE_FILE_TARGET=dev is set but .dev/ holds no build — run ./build-dev.sh first");
+	}
+	checkDevBuildIsCurrent(bundlePath);
+}
+
+// A dev build is a snapshot and nothing invalidates it: edit single-file-core, forget to rebuild,
+// and the suite runs the previous code while reporting on the current one. That failure is silent,
+// and worse, it reads as good news — every variant of an experiment comes out identical, which
+// looks exactly like "the change has no effect". It has already cost a full round of measurements.
+// Comparing the newest core source against the bundle turns it into a refusal to start.
+function checkDevBuildIsCurrent(bundlePath) {
+	const coreDirectory = join(repositoryDirectory, "..", CORE_DIRECTORY_NAME);
+	if (!existsSync(coreDirectory)) {
+		return;
+	}
+	const newest = getNewestSource(coreDirectory);
+	if (newest && newest.time > statSync(bundlePath).mtimeMs) {
+		throw new Error("the .dev/ build is older than " + join(CORE_DIRECTORY_NAME, relative(coreDirectory, newest.path)) +
+			" — run ./build-dev.sh, or the suite measures the previous core and reports it as the current one");
+	}
+}
+
+function getNewestSource(directory, newest) {
+	readdirSync(directory, { withFileTypes: true }).forEach(entry => {
+		if (entry.name.startsWith(".")) {
+			return;
+		}
+		const path = join(directory, entry.name);
+		if (entry.isDirectory()) {
+			if (!IGNORED_DIRECTORY_NAMES.includes(entry.name)) {
+				newest = getNewestSource(path, newest);
+			}
+		} else if (entry.name.endsWith(".js") || entry.name.endsWith(".json")) {
+			const time = statSync(path).mtimeMs;
+			if (!newest || time > newest.time) {
+				newest = { path, time };
+			}
+		}
+	});
+	return newest;
+}
+
+// Unit tests import generated modules directly. They have to go through here too, or they keep
+// testing the released build while the e2e tests exercise the dev one.
+function importLibModule(name) {
+	return import(join(cliDirectory, "lib", name));
+}
+
+// Two waits a fixture served from node:http on localhost never needs, and which cost about 3 seconds
+// of the 4.5 a capture takes: the deferred-image pass waits its full idle time even on a page with no
+// lazy images, and browser-wait-until-delay is a flat second after the load condition is reached.
+// Measured on one page: 5.29 s with the defaults, 3.21 s with the idle time at zero, 2.16 s with both.
+// The idle time rather than --load-deferred-content=false, so the pass still runs and a fixture with
+// lazy images still gets them. Options are last-wins, so a case that sets either of these after
+// spreading this list overrides it, and a case whose subject IS the waiting leaves the list out:
+// lazy-loading, frame-gate, slow-response, timeouts, navigation, service-worker and fidelity do.
+const fastCaptureArgs = ["--load-deferred-content-max-idle-time=0", "--browser-wait-until-delay=0"];
+
+export { cliDirectory, repositoryDirectory, useDevBuild, importLibModule, browserEngine, firefox, fastCaptureArgs };

@@ -1,19 +1,46 @@
 {
 	"name": "single-file-cli",
-	"version": "2.0.64",
+	"version": "2.13.0",
 	"description": "SingleFile CLI",
 	"author": "Gildas Lormeau",
+	"license": "AGPL-3.0-or-later",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gildas-lormeau/single-file-cli.git"
+	},
 	"engines": {
-		"deno": ">=1.4",
-		"bun": ">=1.0",
-		"node": ">=20"
+		"deno": ">=2.2",
+		"bun": ">=1.2",
+		"node": ">=24.0.0"
 	},
 	"type": "module",
+	"files": [
+		"lib",
+		"deno.json",
+		"options.js",
+		"single-file",
+		"single-file.bat",
+		"single-file-cli-api.js",
+		"single-file-launcher.js",
+		"single-file-node.js",
+		"single-file-node.bat"
+	],
+	"scripts": {
+		"test": "node --test \"test/**/*.test.js\"",
+		"test:dev": "SINGLE_FILE_TARGET=dev node --test \"test/**/*.test.js\"",
+		"test:firefox": "SINGLE_FILE_BROWSER_ENGINE=firefox node --test \"test/**/*.test.js\"",
+		"lint": "eslint .",
+		"update-core": "bash update-core.sh"
+	},
 	"bin": {
 		"single-file": "single-file-node.js"
 	},
 	"dependencies": {
-		"simple-cdp": "^1.8.5",
-		"ws": "^8.16.0"
+		"simple-cdp": "^1.10.1"
+	},
+	"devDependencies": {
+		"@eslint/js": "^9.39.5",
+		"esbuild": "^0.27.7",
+		"eslint": "^10.8.1"
 	}
 }

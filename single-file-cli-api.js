@@ -21,55 +21,88 @@
  *   Source.
  */
 
-/* global URL, Blob, FileReader */
+/* global URL */
 
-import * as backend from "./lib/cdp-client.js";
+import { Buffer } from "node:buffer";
+import * as cdpBackend from "./lib/cdp-client.js";
+import * as bidiBackend from "./lib/bidi-client.js";
 import { getZipScriptSource } from "./lib/single-file-script.js";
+import { createPagesArchive, PROCESS_OPTION_NAMES } from "./lib/single-file-archive.js";
+import { getDefaultOptions } from "./options.js";
 import { Deno, path } from "./lib/deno-polyfill.js";
 
 const VALID_URL_TEST = /^(https?|file):\/\//;
 
-const DEFAULT_OPTIONS = {
-	removeHiddenElements: true,
-	removeUnusedStyles: true,
-	removeUnusedFonts: true,
-	compressHTML: true,
-	loadDeferredImages: true,
-	loadDeferredImagesMaxIdleTime: 1500,
-	filenameTemplate: "{page-title} ({date-locale} {time-locale}).html",
-	filenameMaxLength: 192,
-	filenameMaxLengthUnit: "bytes",
-	filenameReplacedCharacters: ["~", "+", "\\\\", "?", "%", "*", ":", "|", "\"", "<", ">", "\x00-\x1f", "\x7F"],
-	filenameReplacementCharacter: "_",
-	maxResourceSize: 10,
+const ARCHIVE_EXCLUDED_OPTION_NAMES = ["disableCompression", "insertTextBody", "password", "url"];
+
+// the command line is the single source of the defaults. only the two options it has no
+// defaultValue for are set here, and the agreement test asserts this overlay stays exactly
+// these two, so a third can only be added deliberately.
+const API_ONLY_DEFAULTS = {
 	backgroundSave: true,
-	removeAlternativeFonts: true,
-	removeAlternativeMedias: true,
-	removeAlternativeImages: true,
-	groupDuplicateImages: true,
-	saveFavicon: true,
-	insertMetaCSP: true,
-	insertSingleFileComment: true,
-	blockScripts: true,
-	blockVideos: true,
-	blockAudios: true
+	saveFavicon: true
 };
+const DEFAULT_OPTIONS = Object.assign(getDefaultOptions(), API_ONLY_DEFAULTS);
 const STATE_PROCESSING = "processing";
 const STATE_PROCESSED = "processed";
 
-const { readTextFile, writeTextFile, writeFile, stdout, mkdir, stat, errors } = Deno;
-let tasks = [], maxParallelWorkers, sessionFilename;
+const { readTextFile, writeTextFile, readFile, writeFile, stdout, mkdir, makeTempDir, remove, stat, errors } = Deno;
+let backend = cdpBackend, tasks = [], maxParallelWorkers, sessionFilename, archiveTempDirectory, errorCount = 0;
 
-export { initialize };
+export { initialize, closeBrowser, getArchiveOptions, ARCHIVE_EXCLUDED_OPTION_NAMES, DEFAULT_OPTIONS, API_ONLY_DEFAULTS };
+
+async function closeBrowser() {
+	await backend.closeBrowser();
+}
 
 async function initialize(options) {
 	options = Object.assign({}, DEFAULT_OPTIONS, options);
+	if ((options.embedPdf || options.embeddedPdf || options.embedScreenshot || options.embeddedImage) && !options.compressContent) {
+		throw new Error("--embed-pdf, --embedded-pdf, --embed-screenshot and --embedded-image require --compress-content");
+	}
+	if (options.dumpJson && options.outputJson) {
+		throw new Error("--dump-json is not compatible with --output-json, which already writes the JSON in place of the page");
+	}
+	if (options.dumpJson && options.dumpContent && !options.output) {
+		throw new Error("--dump-json is not compatible with --dump-content unless --output is set, because both write to stdout");
+	}
+	if (options.crawlSaveArchiveDedup && !options.crawlSaveArchive) {
+		throw new Error("--crawl-save-archive-dedup requires --crawl-save-archive");
+	}
+	if (options.crawlSaveArchiveMarkUnarchivedLinks && !options.crawlSaveArchive) {
+		throw new Error("--crawl-save-archive-mark-unarchived-links requires --crawl-save-archive");
+	}
+	if (options.crawlSaveArchiveToc && !options.crawlSaveArchive) {
+		throw new Error("--crawl-save-archive-toc requires --crawl-save-archive");
+	}
+	if (options.crawlSaveArchivePageList && !options.crawlSaveArchive) {
+		throw new Error("--crawl-save-archive-page-list requires --crawl-save-archive");
+	}
+	if (options.crawlSaveArchivePageTransitions !== undefined && !["auto", "fade", "none"].includes(options.crawlSaveArchivePageTransitions)) {
+		throw new Error("--crawl-save-archive-page-transitions must be \"auto\", \"fade\" or \"none\"");
+	}
+	if (options.crawlSaveArchivePageTransitions !== undefined && options.crawlSaveArchivePageTransitions != "auto" && !options.crawlSaveArchive) {
+		throw new Error("--crawl-save-archive-page-transitions requires --crawl-save-archive");
+	}
+	if (options.crawlSaveArchive) {
+		if (!options.compressContent) {
+			throw new Error("--crawl-save-archive requires --compress-content");
+		}
+		if (options.embedPdf || options.embedScreenshot) {
+			throw new Error("--crawl-save-archive is not compatible with --embed-pdf and --embed-screenshot: an archive has a single PDF and a single image, and they cannot be rendered from one page among many. Use --embedded-pdf and --embedded-image to provide them");
+		}
+		if (options.outputJson || options.insertTextBody || options.password) {
+			throw new Error("--crawl-save-archive is not compatible with --output-json, --insert-text-body and --password");
+		}
+		archiveTempDirectory = await makeTempDir();
+	}
 	maxParallelWorkers = options.maxParallelWorkers || 8;
+	backend = options.browserEngine == "firefox" ? bidiBackend : cdpBackend;
 	try {
 		await backend.initialize(options);
 	} catch (error) {
 		if (error instanceof errors.NotFound) {
-			let message = "Chromium executable not found. ";
+			let message = (options.browserEngine == "firefox" ? "Firefox" : "Chromium") + " executable not found. ";
 			if (options.browserExecutablePath) {
 				message += "Make sure --browser-executable-path is correct.";
 			} else {
@@ -82,7 +115,8 @@ async function initialize(options) {
 	}
 	if (options.crawlSyncSession || options.crawlLoadSession) {
 		try {
-			tasks = JSON.parse(await readTextFile(options.crawlSyncSession || options.crawlLoadSession));
+			tasks = JSON.parse(await readTextFile(options.crawlSyncSession || options.crawlLoadSession))
+				.map(task => Object.assign({ originalUrls: [task.url] }, task));
 		} catch (error) {
 			if (options.crawlLoadSession) {
 				throw error;
@@ -100,9 +134,18 @@ async function initialize(options) {
 
 async function capture(urls, options) {
 	let newTasks;
-	const taskUrls = tasks.map(task => task.url);
-	newTasks = await Promise.all(urls.map(url => createTask(url, options)));
-	newTasks = newTasks.filter(task => task && !taskUrls.includes(task.url));
+	newTasks = await Promise.all(urls.map(value => {
+		let url, taskOptions;
+		if (Array.isArray(value)) {
+			url = value[0];
+			taskOptions = Object.assign({}, options, value[1]);
+		} else {
+			url = value;
+			taskOptions = options;
+		}
+		return createTask(url, taskOptions);
+	}));
+	newTasks = newTasks.filter((task, taskIndex) => task && !mergeDuplicateTask(task, tasks.concat(newTasks.slice(0, taskIndex))));
 	if (newTasks.length) {
 		tasks = tasks.concat(newTasks);
 		await saveTasks();
@@ -113,31 +156,78 @@ async function capture(urls, options) {
 async function finish(options) {
 	const promiseTasks = tasks.map(task => task.promise);
 	await Promise.all(promiseTasks);
+	if (options.crawlSaveArchive) {
+		await savePagesArchive(options);
+	}
 	if (options.crawlReplaceURLs && !options.compressContent) {
 		for (const task of tasks) {
 			try {
-				let pageContent = await readTextFile(task.filename);
+				const outputFilename = getOutputDirectory(options) + task.filename;
+				let pageContent = await readTextFile(outputFilename);
 				tasks.forEach(otherTask => {
 					if (otherTask.filename) {
-						pageContent = pageContent.replace(new RegExp(escapeRegExp("\"" + otherTask.originalUrl + "\""), "gi"), "\"" + otherTask.filename + "\"");
-						pageContent = pageContent.replace(new RegExp(escapeRegExp("'" + otherTask.originalUrl + "'"), "gi"), "'" + otherTask.filename + "'");
-						const filename = otherTask.filename.replace(/ /g, "%20");
-						pageContent = pageContent.replace(new RegExp(escapeRegExp("=" + otherTask.originalUrl + " "), "gi"), "=" + filename + " ");
-						pageContent = pageContent.replace(new RegExp(escapeRegExp("=" + otherTask.originalUrl + ">"), "gi"), "=" + filename + ">");
+						otherTask.originalUrls.forEach(originalUrl => {
+							pageContent = pageContent.replace(new RegExp(escapeRegExp("\"" + originalUrl + "\""), "gi"), "\"" + otherTask.filename + "\"");
+							pageContent = pageContent.replace(new RegExp(escapeRegExp("'" + originalUrl + "'"), "gi"), "'" + otherTask.filename + "'");
+							const filename = otherTask.filename.replace(/ /g, "%20");
+							pageContent = pageContent.replace(new RegExp(escapeRegExp("=" + originalUrl + " "), "gi"), "=" + filename + " ");
+							pageContent = pageContent.replace(new RegExp(escapeRegExp("=" + originalUrl + ">"), "gi"), "=" + filename + ">");
+						});
 					}
 				});
-				await writeTextFile(task.filename, pageContent);
-			} catch (error) {
+				await writeTextFile(outputFilename, pageContent);
+			} catch {
 				// ignored
 			}
 		}
 	}
-	if (!options.browserDebug && !options.browserServer) {
-		return backend.closeBrowser();
+	if (!options.browserDebug) {
+		await backend.closeBrowser();
 	}
+	return errorCount;
 }
 
-async function runTasks() {
+function getArchiveOptions(options) {
+	const archiveOptions = {
+		zipScript: getZipScriptSource(),
+		dedupPages: options.crawlSaveArchiveDedup,
+		markUnarchivedLinks: options.crawlSaveArchiveMarkUnarchivedLinks,
+		tocPage: options.crawlSaveArchiveToc,
+		pageList: options.crawlSaveArchivePageList,
+		pageTransitions: options.crawlSaveArchivePageTransitions,
+		insertSingleFileComment: options.insertSingleFileComment,
+		removeSavedDate: options.removeSavedDate
+	};
+	PROCESS_OPTION_NAMES
+		.filter(name => !ARCHIVE_EXCLUDED_OPTION_NAMES.includes(name) && !(name in archiveOptions))
+		.forEach(name => archiveOptions[name] = options[name]);
+	return archiveOptions;
+}
+
+async function savePagesArchive(options) {
+	const archiveTasks = tasks.filter(task => task.archiveFilename);
+	if (archiveTasks.length) {
+		const pages = archiveTasks.map(task => ({
+			url: task.url,
+			originalUrls: task.originalUrls,
+			title: task.title,
+			getData: () => readFile(task.archiveFilename)
+		}));
+		const content = await createPagesArchive(pages, getArchiveOptions(options));
+		if (options.dumpContent && !options.output) {
+			await stdout.write(content);
+		} else {
+			let outputFilename = options.output || archiveTasks[0].filename || "archive.html";
+			if (options.selfExtractingArchive) {
+				outputFilename = outputFilename.replace(/\.zip$/, ".html");
+			}
+			await writeOutputFile(outputFilename, content, options);
+		}
+	}
+	await remove(archiveTempDirectory, { recursive: true });
+}
+
+function runTasks() {
 	const availableTasks = tasks.filter(task => !task.status).length;
 	const processingTasks = tasks.filter(task => task.status == STATE_PROCESSING).length;
 	const promisesTasks = [];
@@ -151,28 +241,58 @@ async function runNextTask() {
 	const task = tasks.find(task => !task.status);
 	if (task) {
 		const options = task.options;
-		let taskOptions = JSON.parse(JSON.stringify(options));
+		const taskOptions = JSON.parse(JSON.stringify(options));
 		taskOptions.url = task.url;
+		if (taskOptions.crawlSaveArchive) {
+			taskOptions.selfExtractingArchive = false;
+			taskOptions.extractDataFromPage = false;
+			taskOptions.createRootDirectory = false;
+			// the faces belong to the archive, not to the pages it holds: leaving them here would
+			// embed the same PDF and the same image in every page, and copy them once per task
+			taskOptions.embeddedPdf = undefined;
+			taskOptions.embeddedImage = undefined;
+			taskOptions.archiveFilename = archiveTempDirectory + "/" + tasks.indexOf(task) + ".zip";
+		}
 		task.status = STATE_PROCESSING;
 		await saveTasks();
 		task.promise = capturePage(taskOptions);
 		const pageData = await task.promise;
 		task.status = STATE_PROCESSED;
+		if (options.crawlLinks || tasks.length > 1) {
+			const processedCount = tasks.filter(task => task.status == STATE_PROCESSED).length;
+			const filenameInfo = pageData && pageData.filename && !options.crawlSaveArchive && !options.dumpContent ? " (" + pageData.filename + ")" : "";
+			// written to stderr so that stdout stays parseable when using --dump-content
+			console.error(`[${processedCount}/${tasks.length}] ${pageData ? "saved" : "failed"} ${task.url}${filenameInfo}`); // eslint-disable-line no-console
+		}
 		if (pageData) {
 			task.filename = pageData.filename;
+			task.title = pageData.title;
+			task.archiveFilename = pageData.archiveFilename;
 			if (options.crawlLinks && testMaxDepth(task)) {
 				const urls = pageData.links;
-				let newTasks = await Promise.all(urls.map(url => createTask(url, options, task, tasks[0])));
-				newTasks = newTasks.filter(task => task &&
+				let newTasks = await Promise.all(urls.map(url => createTask(url, options, task, task.rootTaskURL || task.url)));
+				newTasks = newTasks.filter((task, taskIndex) => task &&
 					testMaxDepth(task) &&
-					!tasks.find(otherTask => otherTask.url == task.url) &&
 					(!options.crawlInnerLinksOnly || task.isInnerLink) &&
-					(!options.crawlNoParent || (task.isChild || !task.isInnerLink)));
+					(!options.crawlNoParent || (task.isChild || !task.isInnerLink)) &&
+					!mergeDuplicateTask(task, tasks.concat(newTasks.slice(0, taskIndex))));
 				tasks.splice(tasks.length, 0, ...newTasks);
 			}
 		}
 		await saveTasks();
 		await runTasks();
+	}
+}
+
+function mergeDuplicateTask(task, otherTasks) {
+	const duplicateTask = otherTasks.find(otherTask => otherTask && otherTask.url == task.url);
+	if (duplicateTask) {
+		task.originalUrls.forEach(url => {
+			if (!duplicateTask.originalUrls.includes(url)) {
+				duplicateTask.originalUrls.push(url);
+			}
+		});
+		return true;
 	}
 }
 
@@ -182,10 +302,14 @@ function testMaxDepth(task) {
 		(options.crawlExternalLinksMaxDepth == 0 || task.externalLinkDepth < options.crawlExternalLinksMaxDepth);
 }
 
-async function createTask(url, options, parentTask, rootTask) {
+async function createTask(url, options, parentTask, rootTaskURL) {
+	const originalUrl = url;
 	url = parentTask ? rewriteURL(url, options.crawlRemoveURLFragment, options.crawlRewriteRules) : url;
 	if (url) {
 		if (!VALID_URL_TEST.test(url)) {
+			if (parentTask) {
+				return;
+			}
 			try {
 				url = url.replace(/\\/g, "/");
 				url = url.replace(/#/g, "%23");
@@ -195,15 +319,15 @@ async function createTask(url, options, parentTask, rootTask) {
 				throw new Error("Invalid URL or file path: " + url, { cause: error });
 			}
 		}
-		const isInnerLink = rootTask && url.startsWith(getHostURL(rootTask.url));
-		const rootBaseURIMatch = rootTask && rootTask.url.match(/(.*?)[^/]*$/);
+		const isInnerLink = rootTaskURL && url.startsWith(getHostURL(rootTaskURL));
+		const rootBaseURIMatch = rootTaskURL && rootTaskURL.match(/(.*?)[^/]*$/);
 		const isChild = isInnerLink && rootBaseURIMatch && rootBaseURIMatch[1] && url.startsWith(rootBaseURIMatch[1]);
 		return {
 			url,
 			isInnerLink,
 			isChild,
-			originalUrl: url,
-			rootBaseURI: rootBaseURIMatch && rootBaseURIMatch[1],
+			originalUrls: [originalUrl],
+			rootTaskURL,
 			depth: parentTask ? parentTask.depth + 1 : 0,
 			externalLinkDepth: isInnerLink ? -1 : parentTask ? parentTask.externalLinkDepth + 1 : -1,
 			options
@@ -239,7 +363,7 @@ function rewriteURL(url, crawlRemoveURLFragment, crawlRewriteRules = []) {
 
 function getHostURL(url) {
 	url = new URL(url);
-	return url.protocol + "//" + (url.username ? url.username + (url.password || "") + "@" : "") + url.hostname;
+	return url.protocol + "//" + (url.username ? url.username + (url.password ? ":" + url.password : "") + "@" : "") + url.host + "/";
 }
 
 async function capturePage(options) {
@@ -248,54 +372,59 @@ async function capturePage(options) {
 		options.zipScript = getZipScriptSource();
 		const pageData = await backend.getPageData(options);
 		content = pageData.content;
+		// the compressed path emits the BOM inside the archive prologue, where only the writer
+		// can place it; for plain HTML it belongs to whoever saves the file, which is the
+		// extension's download layer there and this function here. The string test keeps the
+		// two apart: compressed content arrives as bytes
+		if (options.includeBOM && typeof content == "string") {
+			content = "\ufeff" + content;
+		}
 		if (options.consoleMessagesFile && pageData.consoleMessages) {
 			await writeTextFile(options.consoleMessagesFile, JSON.stringify(pageData.consoleMessages, null, 2));
 		}
+		if (options.debugMessagesFile && pageData.debugMessages) {
+			await writeTextFile(options.debugMessagesFile, pageData.debugMessages.map(([timestamp, message]) =>
+				`[${new Date(timestamp).toISOString()}] ${message.join(" ")}`).join("\n"));
+		}
+		if (options.archiveFilename) {
+			await writeFile(options.archiveFilename, content);
+			pageData.archiveFilename = options.archiveFilename;
+			dumpJsonMetadata(pageData, options);
+			return pageData;
+		}
 		if (options.outputJson) {
 			if (content instanceof Uint8Array) {
-				const fileReader = new FileReader();
-				fileReader.readAsDataURL(new Blob([content]));
-				content = await new Promise(resolve => {
-					fileReader.onload = () => resolve(fileReader.result);
-				});
-				content = content.replace(/^data:.*?;base64,/, "");
 				pageData.content = undefined;
-				pageData.binaryContent = content;
+				pageData.binaryContent = Buffer.from(content).toString("base64");
 			}
 			pageData.doctype = undefined;
 			pageData.viewport = undefined;
 			pageData.comment = undefined;
 			content = JSON.stringify(pageData, null, 2);
 		}
-		if (options.output) {
-			filename = await getFilename(options.output, options);
-		} else if (options.dumpContent) {
+		if (options.dumpContent && !options.output) {
 			if (options.compressContent) {
 				await stdout.write(content);
 			} else {
 				console.log(content || ""); // eslint-disable-line no-console
 			}
 		} else {
-			filename = await getFilename(pageData.filename, options);
+			let outputFilename = options.output || pageData.filename;
+			if (options.outputJson && !outputFilename.endsWith(".json")) {
+				outputFilename += ".json";
+			}
+			filename = await writeOutputFile(outputFilename, content, options);
 		}
 		if (filename) {
-			if (options.outputJson) {
-				filename += filename.endsWith(".json") ? "" : ".json";
-			}
-			const directoryName = await path.dirname(filename);
-			if (directoryName !== ".") {
-				await mkdir(directoryName, { recursive: true });
-			}
-			if (content instanceof Uint8Array) {
-				await writeFile(filename, content);
-			} else {
-				await writeTextFile(filename, content);
-			}
+			const outputDirectory = getOutputDirectory(options);
+			pageData.filename = filename.startsWith(outputDirectory) ? filename.substring(outputDirectory.length) : filename;
 		}
+		dumpJsonMetadata(pageData, options);
 		return pageData;
 	} catch (error) {
+		errorCount++;
 		const date = new Date();
-		let message = `[${date.toISOString()}] URL: ${options.url}`;
+		let message = `[${date.toISOString()}] URL: ${options.url} Error: ${error.message || error}`;
 		if (!options.errorsTracesDisabled) {
 			message += "\nStack: " + error.stack;
 		}
@@ -305,10 +434,29 @@ async function capturePage(options) {
 		} else {
 			console.error(error.message || error, message); // eslint-disable-line no-console
 		}
+		if (options.consoleMessagesFile && error.consoleMessages) {
+			await writeTextFile(options.consoleMessagesFile, JSON.stringify(error.consoleMessages, null, 2));
+		}
+		if (options.debugMessagesFile && error.debugMessages) {
+			await writeTextFile(options.debugMessagesFile, error.debugMessages.map(([timestamp, message]) =>
+				`[${new Date(timestamp).toISOString()}] ${message.join(" ")}`).join("\n"));
+		}
 	}
 }
 
-async function getFilename(filename, options, index = 1) {
+function dumpJsonMetadata(pageData, options) {
+	if (options.dumpJson) {
+		const metadata = Object.assign({}, pageData);
+		delete metadata.content;
+		delete metadata.binaryContent;
+		delete metadata.doctype;
+		delete metadata.viewport;
+		delete metadata.comment;
+		console.log(JSON.stringify(metadata, null, 2)); // eslint-disable-line no-console
+	}
+}
+
+function getOutputDirectory(options) {
 	if (Array.isArray(options.outputDirectory)) {
 		const outputDirectory = options.outputDirectory.pop();
 		if (outputDirectory.startsWith("/")) {
@@ -321,9 +469,44 @@ async function getFilename(filename, options, index = 1) {
 	if (outputDirectory && !outputDirectory.endsWith("/")) {
 		outputDirectory += "/";
 	}
-	let newFilename = outputDirectory + filename;
+	return outputDirectory;
+}
+
+async function writeOutputFile(outputFilename, content, options) {
+	while (true) {
+		const filename = await getFilename(outputFilename, options);
+		if (!filename) {
+			return;
+		}
+		const directoryName = path.dirname(filename);
+		if (directoryName !== ".") {
+			await mkdir(directoryName, { recursive: true });
+		}
+		// exclusive creation prevents parallel tasks writing the same filename
+		// from silently overwriting each other
+		const writeOptions = { createNew: options.filenameConflictAction != "overwrite" };
+		try {
+			if (content instanceof Uint8Array) {
+				await writeFile(filename, content, writeOptions);
+			} else {
+				await writeTextFile(filename, content, writeOptions);
+			}
+			return filename;
+		} catch (error) {
+			if (!(error instanceof errors.AlreadyExists)) {
+				throw error;
+			}
+			if (options.filenameConflictAction == "skip") {
+				return;
+			}
+		}
+	}
+}
+
+async function getFilename(filename, options, index = 1) {
+	let newFilename = getOutputDirectory(options) + filename;
 	if (options.filenameConflictAction == "overwrite") {
-		return filename;
+		return newFilename;
 	} else if (options.filenameConflictAction == "uniquify" && index > 1) {
 		const regExpMatchExtension = /(\.[^.]+)$/;
 		const matchExtension = newFilename.match(regExpMatchExtension);
@@ -338,7 +521,7 @@ async function getFilename(filename, options, index = 1) {
 		if (options.filenameConflictAction != "skip") {
 			return getFilename(filename, options, index + 1);
 		}
-	} catch (_) {
+	} catch {
 		return newFilename;
 	}
 }

@@ -22,7 +22,12 @@
  */
 
 import { version } from "./lib/version.js";
+import { DEFAULT_MAX_APPENDED_DATA_LENGTH } from "./lib/single-file-archive.js";
 import { Deno } from "./lib/deno-polyfill.js";
+
+const { args, build, env, exit } = Deno;
+const BROWSER_ENGINE_ENVIRONMENT_VARIABLE = "SINGLE_FILE_BROWSER_ENGINE";
+const BROWSER_ENGINES = ["chromium", "firefox"];
 
 const USAGE_TEXT = `single-file [url] [output]
 
@@ -30,228 +35,394 @@ Positionals:
   url     URL or path on the filesystem of the page to save  [string]
   output  Output filename  [string]`;
 
-const OPTIONS_INFO = {
-	"accept-header-font": { description: "Accept header for fonts", type: "string", defaultValue: "application/font-woff2;q=1.0,application/font-woff;q=0.9,*/*;q=0.8" },
-	"accept-header-image": { description: "Accept header for images", type: "string", defaultValue: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8" },
-	"accept-header-stylesheet": { description: "Accept header for stylesheets", type: "string", defaultValue: "text/css,*/*;q=0.1" },
-	"accept-header-script": { description: "Accept header for scripts", type: "string", defaultValue: "*/*" },
-	"accept-header-document": { description: "Accept header for documents", type: "string", defaultValue: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
-	"block-audios": { description: "Block audios", type: "boolean", defaultValue: true },
-	"block-fonts": { description: "Block fonts", type: "boolean" },
-	"block-images": { description: "Block images", type: "boolean" },
-	"block-scripts": { description: "Block scripts", type: "boolean", defaultValue: true },
-	"block-videos": { description: "Block videos", type: "boolean", defaultValue: true },
-	"block-mixed-content": { description: "Block mixed contents", type: "boolean" },
-	"browser-server": { description: "Server to connect to", type: "string" },
+const CATEGORIES = [
+	"Browser Configuration",
+	"Browser Loading & Timing",
+	"Device Emulation",
+	"Network & HTTP",
+	"Content Blocking",
+	"Resource Loading",
+	"Content Processing & Optimization",
+	"Output & Compression",
+	"Filename & Output Location",
+	"Crawling",
+	"Browser Customization & Scripts",
+	"Infobar",
+	"Metadata & HTML Modifications",
+	"Debugging & Logging",
+	"Batch Processing & Configuration",
+	"Advanced/Special Modes",
+	"General"
+];
+
+const OPTIONS_INFO = [{
+	"browser-server": { description: "Server to connect to", type: "string", alias: "browser-remote-debugging-url" },
 	"browser-headless": { description: "Run the browser in headless mode", type: "boolean", defaultValue: true },
 	"browser-executable-path": { description: "Path to chrome/chromium executable", type: "string" },
+	"browser-engine": { description: "Browser engine to use (chromium, firefox). Firefox is driven through WebDriver BiDi and has limitations: --create-browser-profile is not available, --browser-mobile-emulation only sets the viewport size and scale factor, --emulate-media-feature and the pause of --browser-debug are ignored, the requests of service workers do not get the blocked URL patterns and extra HTTP headers, and navigator.webdriver is true in the page", type: "string", defaultValue: "chromium" },
+	"browser-profile": { description: "Path of the browser profile directory to use, e.g. to save pages requiring a logged-in session (see --create-browser-profile). The directory is copied before starting the browser and is left unmodified.", type: "string" },
 	"browser-width": { description: "Width of the browser viewport in pixels", type: "number", defaultValue: 1280 },
 	"browser-height": { description: "Height of the browser viewport in pixels", type: "number", defaultValue: 720 },
-	"browser-load-max-time": { description: "Maximum delay of time to wait for page loading in ms", type: "number", defaultValue: 60000 },
-	"browser-wait-delay": { description: "Time to wait before capturing the page in ms", type: "number" },
-	"browser-wait-until": { description: "When to consider the page is loaded (InteractiveTime, networkIdle, networkAlmostIdle, load, domContentLoaded)", type: "string", defaultValue: "networkIdle" },
-	"browser-wait-until-fallback": { description: "Retry with the next value of --browser-wait-until when a timeout error is thrown", type: "boolean", defaultValue: true },
 	"browser-debug": { description: "Enable debug mode", type: "boolean" },
-	"browser-script": { description: "Path of a script executed in the page (and all the frames) before it is loaded", type: "string[]" },
-	"browser-stylesheet": { description: "Path of a stylesheet file inserted into the page (and all the frames) after it is loaded", type: "string[]" },
 	"browser-arg": { description: "Argument passed to the browser", type: "string[]", alias: "browser-argument" },
 	"browser-args": { description: "Arguments provided as a JSON array and passed to the browser", type: "string" },
+	"browser-single-process": { description: "Run the browser as a single process (enabled by default on Windows only, current browsers on other platforms do not support this mode)", type: "boolean", defaultValue: build.os == "windows" },
 	"browser-start-minimized": { description: "Minimize the browser", type: "boolean" },
-	"browser-cookie": { description: "Ordered list of cookie parameters separated by a comma (name,value,domain,path,expires,httpOnly,secure,sameSite,url)", type: "string[]" },
-	"browser-cookies-file": { description: "Path of the cookies file formatted as a JSON file or a Netscape text file", type: "string" },
 	"browser-ignore-insecure-certs": { description: "Ignore HTTPs errors", type: "boolean" },
-	"browser-remote-debugging-URL": { description: "Remote debugging URL", type: "string" },
+	"browser-bypass-csp": { key: "browserBypassCSP", description: "Bypass the Content Security Policy of the page, needed to save pages enforcing Trusted Types with browsers based on Chromium 150 or older", type: "boolean", defaultValue: false }
+}, {
+	"browser-load-max-time": { description: "Maximum delay of time to wait for loading the page in ms", type: "number", defaultValue: 60000 },
+	"browser-capture-max-time": { description: "Maximum delay of time to wait for capturing the page in ms", type: "number", defaultValue: 60000 },
+	"browser-wait-delay": { description: "Time to wait before capturing the page in ms", type: "number" },
+	"browser-wait-end-delay": { description: "Time to wait after capturing the page in ms", type: "number" },
+	"browser-wait-until": { description: "When to consider the page is loaded (InteractiveTime, networkIdle, networkAlmostIdle, load, DOMContentLoaded)", type: "string", defaultValue: "networkIdle" },
+	"browser-wait-until-delay": { description: "Delay of time in ms to wait before considering the page is loaded when the value of --browser-wait-until is reached", type: "number", defaultValue: 1000 },
+	"browser-wait-until-fallback": { description: "Stop loading the page and capture it as it is when --browser-load-max-time expires before the value of --browser-wait-until is reached, provided the page has reached DOMContentLoaded; a load timeout error is thrown otherwise", type: "boolean", defaultValue: true },
+}, {
 	"browser-mobile-emulation": { description: "Emulate a mobile device", type: "boolean" },
 	"browser-device-width": { description: "Width of the device viewport in pixels (default value is 360 when using --browser-mobile-emulation)", type: "number" },
 	"browser-device-height": { description: "Height of the device viewport in pixels (default value is 800 when using --browser-mobile-emulation)", type: "number" },
 	"browser-device-scale-factor": { description: "Scale factor of the device viewport (default value is 2 when using --browser-mobile-emulation)", type: "number" },
-	"console-messages-file": { description: "Path of the file where to save the console messages in JSON format", type: "string" },
-	"compress-CSS": { description: "Compress CSS stylesheets", type: "boolean" },
-	"compress-HTML": { description: "Compress HTML content", type: "boolean", defaultValue: true },
-	"crawl-links": { description: "Crawl and save pages found via inner links", type: "boolean" },
-	"crawl-inner-links-only": { description: "Crawl pages found via inner links only if they are hosted on the same domain", type: "boolean", defaultValue: true },
-	"crawl-no-parent": { description: "Crawl pages found via inner links only if their URLs are not parent of the URL to crawl", type: "boolean" },
-	"crawl-load-session": { description: "Name of the file of the session to load (previously saved with --crawl-save-session or --crawl-sync-session)", type: "string" },
-	"crawl-remove-URL-fragment": { description: "Remove URL fragments found in links", type: "boolean", defaultValue: true },
-	"crawl-save-session": { description: "Name of the file where to save the state of the session", type: "string" },
-	"crawl-sync-session": { description: "Name of the file where to load and save the state of the session", type: "string" },
-	"crawl-max-depth": { description: "Max depth when crawling pages found in internal and external links (0: infinite)", type: "number", defaultValue: 1 },
-	"crawl-external-links-max-depth": { description: "Max depth when crawling pages found in external links (0: infinite)", type: "number", defaultValue: 1 },
-	"crawl-replace-URLs": { description: "Replace URLs of saved pages with relative paths of saved pages on the filesystem", type: "boolean" },
-	"crawl-rewrite-rule": { description: "Rewrite rule used to rewrite URLs of crawled pages", type: "string[]" },
-	"dump-content": { description: "Dump the content of the processed page in the console ('true' when running in Docker)", type: "boolean" },
-	"emulate-media-feature": { description: "Emulate a media feature. The syntax is <name>:<value>, e.g. \"prefers-color-scheme:dark\"", type: "string[]" },
-	"errors-file": { description: "Path of the file where to save the error messages", type: "string", alias: "error-file" },
-	"errors-traces-disabled": { description: "Remove error stack traces in the error messages", type: "boolean", defaultValue: true, alias: "error-traces-disabled" },
-	"filename-template": { description: "Template used to generate the output filename (see help page of the extension for more info)", type: "string", defaultValue: "%if-empty<{page-title}|No title> ({date-locale} {time-locale}).{filename-extension}" },
-	"filename-conflict-action": { description: "Action when the filename is conflicting with existing one on the filesystem. The possible values are \"uniquify\" (default), \"overwrite\" and \"skip\"", type: "string", defaultValue: "uniquify" },
-	"filename-replacement-character": { description: "The character used for replacing invalid characters in filenames", type: "string", defaultValue: "_" },
-	"filename-max-length": { description: "Specify the maximum length of the filename", type: "number", defaultValue: 192 },
-	"filename-max-length-unit": { description: "Specify the unit of the maximum length of the filename ('bytes' or 'chars')", type: "string", defaultValue: "bytes" },
-	"replace-emojis-in-filename": { description: "Replace emojis in the filename with their unicode text representation", type: "boolean" },
-	"group-duplicate-images": { description: "Group duplicate images into CSS custom properties", type: "boolean", defaultValue: true },
-	"max-size-duplicate-images": { description: "Maximum size in bytes of duplicate images stored as CSS custom properties", type: "number", defaultValue: 512 * 1024 },
-	"help": { description: "Show help", type: "boolean" },
+	"user-agent": { description: "User-agent of the browser", type: "string" },
+	"accept-language": { description: "Accept language of the browser", type: "string" },
+	"platform": { description: "Platform of the browser (default value is \"Android\" when using --browser-mobile-emulation)", type: "string" },
+	"emulate-media-feature": { description: "Emulate a media feature. The syntax is <name>:<value>, e.g. \"prefers-color-scheme:dark\"", type: "string[]" }
+}, {
 	"http-header": { description: "Extra HTTP header", type: "string[]" },
 	"http-proxy-server": { description: "Proxy address", type: "string" },
 	"http-proxy-username": { description: "HTTP username", type: "string" },
 	"http-proxy-password": { description: "HTTP password", type: "string" },
-	"include-BOM": { description: "Include the UTF-8 BOM into the HTML page", type: "boolean" },
-	"include-infobar": { description: "Include the infobar", type: "boolean" },
-	"infobar-template": { description: "Template used to generate the infobar content (see help page of the extension for more info)", type: "string" },
-	"open-infobar": { description: "Keep the infobar open when using --include-infobar", type: "boolean" },
-	"insert-meta-CSP": { description: "Include a <meta> tag with a CSP to avoid potential requests to internet when viewing a page", type: "boolean", defaultValue: true },
-	"load-deferred-images": { description: "Load deferred (a.k.a. lazy-loaded) images", type: "boolean", defaultValue: true },
-	"load-deferred-images-dispatch-scroll-event": { description: "Dispatch 'scroll' event when loading deferred images", type: "boolean" },
-	"load-deferred-images-max-idle-time": { description: "Maximum delay of time to wait for deferred images in ms", type: "number", defaultValue: 1500 },
-	"load-deferred-images-keep-zoom-level": { description: "Load deferred images by keeping zoomed out the page", type: "boolean" },
-	"load-deferred-images-before-frames": { description: "Load deferred frames before before saving fame contents", type: "boolean" },
-	"max-parallel-workers": { description: "Maximum number of browsers launched in parallel when processing a list of URLs (cf --urls-file)", type: "number", defaultValue: 8 },
+	"accept-header-font": { description: "Accept header for fonts", type: "string", defaultValue: "application/font-woff2;q=1.0,application/font-woff;q=0.9,*/*;q=0.8" },
+	"accept-header-image": { description: "Accept header for images", type: "string", defaultValue: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8" },
+	"accept-header-stylesheet": { description: "Accept header for stylesheets", type: "string", defaultValue: "text/css,*/*;q=0.1" },
+	"accept-header-script": { description: "Accept header for scripts", type: "string", defaultValue: "*/*" },
+	"accept-header-document": { description: "Accept header for documents", type: "string", defaultValue: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" }
+}, {
+	"block-audios": { description: "Block audios", type: "boolean", defaultValue: true },
+	"block-fonts": { description: "Block fonts", type: "boolean" },
+	"block-images": { description: "Block images", type: "boolean" },
+	"block-alternative-images": { description: "Block alternative images", type: "boolean", defaultValue: true },
+	"block-scripts": { description: "Block scripts", type: "boolean", defaultValue: true },
+	"block-stylesheets": { description: "Block stylesheets", type: "boolean", defaultValue: false },
+	"block-videos": { description: "Block videos", type: "boolean", defaultValue: true },
+	"block-mixed-content": { description: "Block active content (i.e. stylesheets, scripts, fonts) served from HTTP in HTTPS pages, like browsers do; images, videos and audios are unaffected", type: "boolean" },
+	"blocked-url-pattern": { key: "blockedURLPatterns", description: "Regular expression matching URLs to block (e.g. 'annoying-banners\\.com')", type: "string[]" }
+}, {
+	"load-deferred-content": { key: "loadDeferredContent", alias: "load-deferred-images", description: "Load deferred (a.k.a. lazy-loaded) content, i.e. images, frames, and the messages a page unmounts while you scroll", type: "boolean", defaultValue: true },
+	"load-deferred-content-dispatch-scroll-event": { key: "loadDeferredContentDispatchScrollEvent", alias: "load-deferred-images-dispatch-scroll-event", description: "Dispatch 'scroll' event when loading deferred content", type: "boolean", defaultValue: true },
+	"load-deferred-content-max-idle-time": { key: "loadDeferredContentMaxIdleTime", alias: "load-deferred-images-max-idle-time", description: "Maximum delay of time to wait for deferred content in ms", type: "number", defaultValue: 1500 },
+	"load-deferred-content-keep-zoom-level": { key: "loadDeferredContentKeepZoomLevel", alias: "load-deferred-images-keep-zoom-level", description: "Keep the page zoomed out while loading deferred content, instead of zooming out only for the moment the page is measured", type: "boolean" },
+	"load-deferred-content-before-frames": { key: "loadDeferredContentBeforeFrames", alias: "load-deferred-images-before-frames", description: "Load deferred content in frames before saving their contents", type: "boolean" },
+	"load-deferred-content-min-zoom-factor": { description: "Smallest zoom factor used while loading deferred content, between 0 and 1. The page is zoomed out to make the site believe the whole document is on screen, which also shrinks every measurement the site takes at that moment. Raise this to bound that effect, or set it to 1 to load deferred content without zooming out at all", type: "number" },
+	"load-deferred-content-block-cookies": { description: "Block access to document.cookie while loading deferred content", type: "boolean" },
+	"load-deferred-content-block-storage": { description: "Block access to localStorage and indexedDB while loading deferred content", type: "boolean" },
 	"max-resource-size-enabled": { description: "Enable removal of embedded resources exceeding a given size", type: "boolean" },
-	"max-resource-size": { description: "Maximum size of embedded resources in MB (i.e. images, stylesheets, scripts and iframes)", type: "number", defaultValue: 10 },
-	"move-styles-in-head": { description: "Move style elements outside the head element into the head element", type: "boolean" },
-	"password": { description: "Password of the zip file when using --compress-content or --self-extracting-archive", type: "string" },
+	"max-resource-size": { description: "Maximum size of embedded resources in MB. It applies to every fetched resource, i.e. images, fonts, stylesheets, scripts, frames, videos and audios; a resource above the limit is left out of the saved page", type: "number", defaultValue: 10 }
+}, {
+	"compress-css": { key: "compressCSS", description: "Compress CSS stylesheets", type: "boolean" },
+	"compress-html": { key: "compressHTML", description: "Compress HTML content", type: "boolean", defaultValue: true },
 	"remove-frames": { description: "Remove frames", type: "boolean" },
 	"remove-hidden-elements": { description: "Remove HTML elements which are not displayed", type: "boolean", defaultValue: true },
+	"removed-elements-selector": { description: "Remove specific HTML elements matching the given CSS selectors (comma separated)", type: "string" },
 	"remove-unused-styles": { description: "Remove unused CSS rules and unneeded declarations", type: "boolean", defaultValue: true },
 	"remove-unused-fonts": { description: "Remove unused CSS font rules", type: "boolean", defaultValue: true },
-	"remove-saved-date": { description: "Remove saved date metadata in HTML header", type: "boolean" },
 	"remove-alternative-fonts": { description: "Remove alternative fonts to the ones displayed", type: "boolean", defaultValue: true },
 	"remove-alternative-medias": { description: "Remove alternative CSS stylesheets", type: "boolean", defaultValue: true },
 	"remove-alternative-images": { description: "Remove images for alternative sizes of screen", type: "boolean", defaultValue: true },
-	"save-original-URLs": { description: "Save the original URLS in the embedded contents", type: "boolean" },
-	"save-raw-page": { description: "Save the original page without interpreting it into the browser", type: "boolean" },
-	"urls-file": { description: "Path to a text file containing a list of URLs (separated by a newline) to save", type: "string" },
-	"user-agent": { description: "User-agent of the browser", type: "string" },
-	"accept-language": { description: "Accept language of the browser", type: "string" },
-	"platform": { description: "Platform of the browser (default value is \"Android\" when using --browser-mobile-emulation)", type: "string" },
-	"user-script-enabled": { description: "Enable the event API allowing to execute scripts before the page is saved", type: "boolean", defaultValue: true },
+	"remove-no-script-tags": { description: "Remove <noscript> tags", type: "boolean", defaultValue: true },
+	"move-styles-in-head": { description: "Move style elements outside the head element into the head element", type: "boolean" },
+	"group-duplicate-images": { description: "Group duplicate images into CSS custom properties", type: "boolean", defaultValue: true },
+	"max-size-duplicate-images": { description: "Maximum size in bytes of duplicate images stored as CSS custom properties", type: "number", defaultValue: 512 * 1024 },
+	"image-reduction-factor": { description: "Divide the dimensions of PNG, JPEG and WEBP images by this factor in order to reduce the size of the page (e.g. 2 halves them)", type: "number", defaultValue: 1 },
+	"group-duplicate-stylesheets": { description: "Group duplicate inline stylesheets into a single stylesheet in order to reduce the size of the page", type: "boolean", defaultValue: false }
+}, {
 	"compress-content": { description: "Create a ZIP file instead of an HTML file", type: "boolean" },
+	"disable-compression": { description: "Store the files of the ZIP file without compressing them", type: "boolean" },
 	"self-extracting-archive": { description: "Create a self-extracting (ZIP) HTML file", type: "boolean", defaultValue: true },
+	"password": { description: "Password of the zip file when using --compress-content or --self-extracting-archive", type: "string" },
 	"insert-text-body": { description: "Insert the text of the page into the self-extracting HTML file", type: "boolean" },
-	"create-root-directory": { description: "Create a root directory based on the timestamp", type: "boolean" },
+	"create-root-directory": { description: "Create a root directory based on the timestamp. With --crawl-save-archive it stores the first page in a folder of its own instead, like the other pages, so that no page shares the root of the archive with the files describing it", type: "boolean" },
 	"extract-data-from-page": { description: "Extract compressed data from the page instead of fetching the page in order to create universal self-extracting HTML files", type: "boolean", defaultValue: true },
 	"prevent-appended-data": { description: "Prevent appending data after the compressed data when creating self-extracting HTML files", type: "boolean" },
+	"declare-appended-data": { description: "Declare the data appended after the compressed data as the comment of the ZIP archive, for readers rejecting undeclared trailing bytes (e.g. java.util.zip); ZIP tools then print that data when listing the archive. Has no effect when the extra data is relocated ahead of the compressed data, because nothing is appended then", type: "boolean" },
+	"max-appended-data-length": { description: `Maximum number of bytes appended after the compressed data when creating self-extracting HTML files, ${DEFAULT_MAX_APPENDED_DATA_LENGTH} by default. Readers only tolerate trailing bytes as far back as their end-of-archive scan reaches (16383 bytes for libarchive, 32768 for perl Archive::Zip, 65557 for Python zipfile); the default fits the narrowest. Data over the limit is relocated ahead of the compressed data instead. Raising the limit above 65535 silently defeats --declare-appended-data: the declaration is the length of the ZIP comment, a 16-bit field, so a longer run is appended undeclared and without a warning`, type: "number" },
 	"embed-screenshot": { description: "Embed a screenshot of the page as a PNG file in the compressed file (self-extracting HTML or ZIP file). When enabled, the resulting file can be read as a ZIP file or a PNG image.", type: "boolean" },
 	"embed-screenshot-options": { description: "Options passed to the CDP method `Page.captureScreenshot()` given as a JSON string (e.g. { \"captureBeyondViewport\": false })", type: "string" },
-	"embedded-image": { description: "Path to a PNG image to embed in the compressed file.", type: "string" },
+	"embedded-image": { description: "Path to a PNG image to embed in the compressed file. Unlike --embed-screenshot it is also compatible with --crawl-save-archive, where it becomes the image of the whole archive.", type: "string" },
 	"embed-pdf": { description: "Embed a PDF file in the ZIP or self-extracting file. When enabled, the resulting file can be read as a ZIP file or a PDF file.", type: "boolean" },
 	"embed-pdf-options": { description: "Options passed to the CDP method `Page.printToPDF()` given as a JSON string (e.g. { \"pageRanges\": \"1-1\", \"paperWidth\": 11, \"paperHeight\": 8.5 })", type: "string" },
-	"embedded-pdf": { description: "Path to a PDF file to embed in the compressed file.", type: "string" },
-	"output-directory": { description: "Path to where to save files, this path must exist.", type: "string" },
-	"version": { description: "Print the version number and exit.", type: "boolean" },
-	"output-json": { description: "Output the result as a JSON string containing the page and network info", type: "boolean" },
+	"embedded-pdf": { description: "Path to a PDF file to embed in the compressed file. Unlike --embed-pdf it is also compatible with --crawl-save-archive, where it becomes the PDF of the whole archive.", type: "string" }
+}, {
+	"filename-template": { description: "Template used to generate the output filename (see https://github.com/gildas-lormeau/SingleFile/wiki/Template-variables-and-functions)", type: "string", defaultValue: "%if-empty<{page-title}|No title> ({date-locale} {time-locale}).{filename-extension}" },
+	"filename-conflict-action": { description: "Action when the filename is conflicting with existing one on the filesystem. The possible values are \"uniquify\" (default), \"overwrite\" and \"skip\"", type: "string", defaultValue: "uniquify" },
+	"filename-replacement-character": { description: "The character used for replacing invalid characters in filenames", type: "string", defaultValue: "_" },
+	"filename-replaced-character": { description: "Character to replace in filenames followed by the replacement character(s), both in a single value separated by a space, e.g. --filename-replaced-character \"> _GT_\" to replace \">\" with \"_GT_\" (repeat the option to replace multiple characters)", type: "string[]", defaultValue: ["~ ～", "+ ＋", "? ？", "% ％", "* ＊", ": ：", "| ｜", "\" ＂", "< ＜", "> ＞", "\\\\ ＼", "\\x00-\\x1f", "\x7F"] },
+	"filename-max-length": { description: "Specify the maximum length of the filename", type: "number", defaultValue: 192 },
+	"filename-max-length-unit": { description: "Specify the unit of the maximum length of the filename ('bytes' or 'chars')", type: "string", defaultValue: "bytes" },
+	"replace-emojis-in-filename": { description: "Replace emojis in the filename with their unicode text representation", type: "boolean" },
+	"output-directory": { description: "Path to where to save files, this path must exist.", type: "string" }
+}, {
+	"crawl-links": { description: "Crawl and save pages found via inner links", type: "boolean" },
+	"crawl-inner-links-only": { description: "Crawl pages found via inner links only if they are hosted on the same domain", type: "boolean", defaultValue: true },
+	"crawl-no-parent": { description: "Crawl pages found via inner links only if their URLs are not parent of the URL to crawl", type: "boolean" },
+	"crawl-load-session": { description: "Name of the file of the session to load (previously saved with --crawl-save-session or --crawl-sync-session)", type: "string" },
+	"crawl-remove-url-fragment": { key: "crawlRemoveURLFragment", description: "Remove URL fragments found in links", type: "boolean", defaultValue: true },
+	"crawl-save-session": { description: "Name of the file where to save the state of the session", type: "string" },
+	"crawl-sync-session": { description: "Name of the file where to load and save the state of the session", type: "string" },
+	"crawl-max-depth": { description: "Max depth when crawling pages found in internal and external links (0: infinite)", type: "number", defaultValue: 1 },
+	"crawl-external-links-max-depth": { description: "Max depth when crawling pages found in external links (0: infinite)", type: "number", defaultValue: 1 },
+	"crawl-replace-urls": { key: "crawlReplaceURLs", description: "Replace URLs of saved pages with relative paths of saved pages on the filesystem", type: "boolean" },
+	"crawl-rewrite-rule": { description: "Rewrite rule used to rewrite URLs of crawled pages", type: "string[]" },
+	"crawl-save-archive": { description: "Save all the crawled pages into a single (self-extracting) ZIP file, requires --compress-content", type: "boolean" },
+	"crawl-save-archive-dedup": { description: "Deduplicate identical resources shared between pages when using --crawl-save-archive", type: "boolean" },
+	"crawl-save-archive-mark-unarchived-links": { description: "Mark links to pages not saved in the archive when using --crawl-save-archive", type: "boolean" },
+	"crawl-save-archive-page-transitions": { description: "Page transitions when navigating in the archive saved with --crawl-save-archive. The possible values are \"auto\" (default, i.e. transitions run when pages opt in via CSS), \"fade\" and \"none\"", type: "string", defaultValue: "auto" },
+	"crawl-save-archive-page-list": { description: "Insert the list of the crawled pages in the prelude of the archive when using --crawl-save-archive, so that indexing tools can read it without extracting the archive", type: "boolean" },
+	"crawl-save-archive-toc": { description: "Save a table of contents page into the archive when using --crawl-save-archive", type: "boolean" },
+}, {
+	"browser-script": { description: "Path of a script executed in the page (and all the frames) before it is loaded", type: "string[]" },
+	"browser-stylesheet": { description: "Path of a stylesheet file inserted into the page (and all the frames) after it is loaded", type: "string[]" },
+	"browser-cookie": { description: "Ordered list of cookie parameters separated by a comma (name,value,domain,path,expires,httpOnly,secure,sameSite,url)", type: "string[]" },
+	"browser-cookies-file": { description: "Path of the cookies file formatted as a JSON file or a Netscape text file", type: "string" },
+	"user-script-enabled": { description: "Enable the event API allowing to execute scripts before the page is saved", type: "boolean", defaultValue: true },
+}, {
+	"include-infobar": { description: "Include the infobar", type: "boolean" },
+	"infobar-template": { description: "Template used to generate the infobar content (see help page of the extension for more info)", type: "string" },
+	"open-infobar": { description: "Keep the infobar open when using --include-infobar", type: "boolean" },
+	"infobar-position-absolute": { description: "Position the infobar absolutely (fixed otherwise)", type: "boolean" },
+	"infobar-position-top": { description: "Position the infobar at the top of the page", type: "string", defaultValue: "16px" },
+	"infobar-position-bottom": { description: "Position the infobar at the bottom of the page", type: "string", defaultValue: "" },
+	"infobar-position-right": { description: "Position the infobar at the right of the page", type: "string", defaultValue: "16px" },
+	"infobar-position-left": { description: "Position the infobar at the left of the page", type: "string", defaultValue: "" },
+}, {
+	"include-bom": { key: "includeBOM", description: "Include the UTF-8 BOM into the HTML page, ignored when the page is compressed unless --extract-data-from-page is disabled and no image is embedded", type: "boolean" },
+	"insert-canonical-link": { description: "Insert a <link rel=canonical> element pointing at the URL of the page, ignored when the page is not saved from an HTTP(S) URL", type: "boolean", defaultValue: true },
+	"insert-meta-csp": { key: "insertMetaCSP", description: "Include a <meta> tag with a CSP to avoid potential requests to internet when viewing a page", type: "boolean", defaultValue: true },
+	"insert-meta-noindex": { key: "insertMetaNoIndex", description: "Insert a <meta name=robots content=noindex> element, so a saved page served on a public host is not indexed. Ignored when the page already declares noindex", type: "boolean" },
+	"remove-saved-date": { description: "Remove saved date metadata in HTML header", type: "boolean" },
+	"read-maff-metadata": { description: "Read the original URL and the archive time from the index.rdf file stored next to a page extracted from a MAFF archive, and save those instead of the path and the date of the extracted copy. Fetches index.rdf next to every page saved, a request that 404s on the open web, so leave it off unless you are saving extracted MAFF pages", type: "boolean" },
+	"save-original-urls": { key: "saveOriginalURLs", description: "Save the original URLS in the embedded contents", type: "boolean" },
 	"insert-single-file-comment": { description: "Insert a comment in the HTML header with the URL of the page", type: "boolean", defaultValue: true },
-	"resolve-links": { description: "Resolve link URLs to absolute URLs", type: "boolean", defaultValue: true },
+	"resolve-links": { description: "Resolve link URLs to absolute URLs", type: "boolean", defaultValue: true }
+}, {
+	"console-messages-file": { description: "Path of the file where to save the console messages in JSON format", type: "string" },
+	"debug-messages-file": { description: "Path of the file where to save the debug messages", type: "string" },
+	"errors-file": { description: "Path of the file where to save the error messages", type: "string", alias: "error-file" },
+	"errors-traces-disabled": { description: "Remove error stack traces in the error messages", type: "boolean", defaultValue: true, alias: "error-traces-disabled" },
+	"dump-content": { description: "Dump the content of the processed page in the console ('true' when running in Docker)", type: "boolean" }
+}, {
+	"urls-file": { description: "Path to a text file containing a list of URLs (separated by a newline) to save. You can also pass the options after each URL (e.g. 'https://www.example.com --filename-template={page-title}.html')", type: "string" },
+	"max-parallel-workers": { description: "Maximum number of browsers launched in parallel when processing a list of URLs (cf --urls-file)", type: "number", defaultValue: 8 },
 	"settings-file": { description: "Path to a JSON file containing the settings exported from the web extension", type: "string" },
-	"settings-file-profile": { description: "Name of the profile to use when using --settings-file", type: "string", defaultValue: "default" },
-	"group-duplicate-stylesheets": { description: "Group duplicate inline stylesheets into a single stylesheet in order to reduce the size of the page", type: "boolean", defaultValue: true }
+	"settings-file-profile": { description: "Name of the profile to use when using --settings-file", type: "string", defaultValue: "default" }
+}, {
+
+	"save-raw-page": { description: "Save the original page without interpreting it into the browser", type: "boolean" },
+	"output-json": { description: "Output the result as a JSON string containing the page and network info", type: "boolean" },
+	"dump-json": { description: "Write the same JSON as --output-json to stdout, without the page content, and leave the page file alone. Unlike --output-json the page is still written where it would have been, so the two outputs can be combined. Incompatible with --output-json, and with --dump-content unless --output is set, because both write to stdout", type: "boolean" },
+	"create-browser-profile": { description: "Path of the browser profile directory to create or update instead of saving a page. The browser is started with a visible window on the URL passed as argument, log in to the website and quit the browser to save the profile, then pass it to --browser-profile when saving pages", type: "string" },
+
+}, {
+	"help": { description: "Show help", type: "boolean" },
+	"version": { description: "Print the version number and exit.", type: "boolean" },
+}];
+
+const CRAWL_LINKS_DEPENDENT_OPTIONS = {
+	crawlInnerLinksOnly: "--crawl-inner-links-only",
+	crawlNoParent: "--crawl-no-parent",
+	crawlRemoveURLFragment: "--crawl-remove-url-fragment",
+	crawlMaxDepth: "--crawl-max-depth",
+	crawlExternalLinksMaxDepth: "--crawl-external-links-max-depth",
+	crawlRewriteRules: "--crawl-rewrite-rule"
 };
+export { getOptions, getDefaultOptions, parseArgs, applySettings, parseUrlsFile };
 
-const { args, exit } = Deno;
-const options = await getOptions();
-export default options;
-
-async function getOptions() {
-	const { positionals, options } = parseArgs(Array.from(args));
-	const unknownOptions = [];
-	positionals.forEach(positional => {
-		if (positional.startsWith("--")) {
-			unknownOptions.push(positional);
-			positionals.splice(positionals.indexOf(positional), 1);
-		}
-	});
-	if ((!positionals.length && !Object.keys(options).length) || positionals.length > 2 || options.help || unknownOptions.length) {
-		console.log(USAGE_TEXT + "\n"); // eslint-disable-line no-console
-		console.log("Options:"); // eslint-disable-line no-console
-		Object.keys(OPTIONS_INFO).forEach(optionName => {
-			const optionInfo = getOptionInfo(optionName);
-			let optionType = optionInfo.type;
-			if (isArray(optionType)) {
-				optionType = optionType.replace("[]", "*");
+function parseUrlsFile(content) {
+	return content.split("\n")
+		.map(line => line.trim())
+		.filter(line => line)
+		.map(line => {
+			let optionPosition = line.indexOf(" --");
+			if (optionPosition < 0) {
+				optionPosition = line.indexOf("\t--");
 			}
-			const optionDescription = optionInfo.description;
-			const optionDefaultValue = optionInfo.defaultValue === undefined ? "" : `(default: ${JSON.stringify(optionInfo.defaultValue)})`;
-			console.log(`  --${optionName}: ${optionDescription} <${optionType}> ${optionDefaultValue}`); // eslint-disable-line no-console
+			if (optionPosition > 0) {
+				const url = line.substring(0, optionPosition).trim();
+				const { options, positionals, invalidOptions } = parseArgs(tokenizeArgs(line.substring(optionPosition + 1).trim()), false);
+				positionals.filter(positional => positional.startsWith("--")).forEach(option =>
+					console.warn(`Warning: Unknown option ${option} (${url})`)); // eslint-disable-line no-console
+				invalidOptions.forEach(({ name, value }) => console.warn(value === undefined ? // eslint-disable-line no-console
+					`Warning: Missing value for --${name} (${url})` :
+					`Warning: Invalid value for --${name}: ${JSON.stringify(value)} (${url})`));
+				return [url, options];
+			} else {
+				return line;
+			}
 		});
-		if (unknownOptions.length) {
-			console.log(""); // eslint-disable-line no-console
-			console.log(`Error: Unknown option${unknownOptions.length > 1 ? "s" : ""} ${unknownOptions.join(", ")}`); // eslint-disable-line no-console
+}
+
+function tokenizeArgs(argsString) {
+	const args = [];
+	let previousCharacter, previousPreviousCharacter, lastQuoteCharacter;
+	let lastCharIndex = 0;
+	for (let currentCharIndex = 0; currentCharIndex < argsString.length; currentCharIndex++) {
+		const character = argsString[currentCharIndex];
+		if (character == lastQuoteCharacter && (previousCharacter != "\\" || previousPreviousCharacter == "\\")) {
+			args.push(argsString.substring(lastCharIndex, currentCharIndex));
+			lastQuoteCharacter = null;
+			lastCharIndex = currentCharIndex + 1;
+		} else if (!lastQuoteCharacter) {
+			if (character == "'" || character == "\"") {
+				lastQuoteCharacter = character;
+				lastCharIndex = currentCharIndex + 1;
+			} else if (character == " " || character == "\t" || character == "=") {
+				if (lastCharIndex < currentCharIndex) {
+					args.push(argsString.substring(lastCharIndex, currentCharIndex));
+				}
+				lastCharIndex = currentCharIndex + 1;
+			}
 		}
-		console.log(""); // eslint-disable-line no-console
+		previousPreviousCharacter = previousCharacter;
+		previousCharacter = character;
+	}
+	if (lastCharIndex < argsString.length) {
+		args.push(argsString.substring(lastCharIndex).trim());
+	}
+	return args;
+}
+
+function applySettings(options, settings, explicitOptions = parseArgs(Array.from(args), false).options) {
+	const profiles = settings.profiles || {};
+	let profileName = options.settingsFileProfile;
+	if (profileName == "default" || profileName === undefined) {
+		profileName = "__Default_Settings__";
+	} else if (!profiles[profileName]) {
+		const profileNames = Object.keys(profiles).filter(name => name != "__Default_Settings__");
+		throw new Error(`Unknown profile ${JSON.stringify(profileName)}, available profiles: ${profileNames.join(", ")}`);
+	}
+	Object.assign(options, profiles[profileName], explicitOptions);
+	delete options.settingsFile;
+}
+
+function getDefaultOptions() {
+	return parseArgs([]).options;
+}
+
+function getOptions() {
+	const { positionals, options, invalidOptions } = parseArgs(Array.from(args));
+	const explicitOptions = parseArgs(Array.from(args), false).options;
+	const environmentBrowserEngine = env.get(BROWSER_ENGINE_ENVIRONMENT_VARIABLE);
+	if (explicitOptions.browserEngine === undefined && environmentBrowserEngine) {
+		if (BROWSER_ENGINES.includes(environmentBrowserEngine)) {
+			options.browserEngine = environmentBrowserEngine;
+		} else {
+			invalidOptions.push({ name: "browser-engine", value: environmentBrowserEngine });
+		}
+	}
+	const unknownOptions = positionals.filter(positional => positional.startsWith("--"));
+	const urls = positionals.filter(positional => !positional.startsWith("--"));
+	if (options.help) {
+		printUsage();
 		exit(0);
 	}
 	if (options.version) {
 		console.log(version); // eslint-disable-line no-console
 		exit(0);
 	}
-	Object.keys(OPTIONS_INFO).forEach(optionName => {
-		const optionInfo = getOptionInfo(optionName);
-		const optionKey = getOptionKey(optionName, optionInfo);
-		if (options[optionKey] === undefined && optionInfo.defaultValue !== undefined) {
-			options[optionKey] = OPTIONS_INFO[optionName].defaultValue;
+	const errorMessages = [];
+	unknownOptions.forEach(option => errorMessages.push(`Unknown option ${option}`));
+	invalidOptions.forEach(({ name, value }) => errorMessages.push(value === undefined ?
+		`Missing value for --${name}` :
+		`Invalid value for --${name}: ${JSON.stringify(value)}`));
+	if (!urls.length && !options.urlsFile && !options.createBrowserProfile) {
+		errorMessages.push("The URL or path of the page to save is required");
+	}
+	if (urls.length > 2) {
+		errorMessages.push(`Unexpected arguments: ${urls.slice(2).join(", ")}`);
+	}
+	if (options.createBrowserProfile) {
+		if (options.browserEngine == "firefox") {
+			errorMessages.push("--create-browser-profile is not supported with --browser-engine firefox");
 		}
-	});
-	options.acceptHeaders = {
-		font: options.acceptHeaderFont,
-		image: options.acceptHeaderImage,
-		stylesheet: options.acceptHeaderStylesheet,
-		script: options.acceptHeaderScript,
-		document: options.acceptHeaderDocument
-	};
-	if (options.browserArgs) {
-		const browserArguments = options.browserArguments || [];
-		browserArguments.push(...JSON.parse(options.browserArgs));
-		options.browserArgs = browserArguments;
-		delete options.browserArguments;
+		if (options.browserProfile) {
+			errorMessages.push("--create-browser-profile cannot be used with --browser-profile, it already takes the path of the profile directory");
+		}
+		if (options.browserServer) {
+			errorMessages.push("--create-browser-profile cannot be used with --browser-server");
+		}
+	} else if (options.browserProfile && options.browserServer) {
+		errorMessages.push("--browser-profile cannot be used with --browser-server");
 	}
-	if (options.browserArguments) {
-		options.browserArgs = options.browserArguments;
-		delete options.browserArguments;
+	if (!options.crawlLinks) {
+		Object.keys(CRAWL_LINKS_DEPENDENT_OPTIONS)
+			.filter(optionKey => explicitOptions[optionKey] !== undefined)
+			.forEach(optionKey => errorMessages.push(`${CRAWL_LINKS_DEPENDENT_OPTIONS[optionKey]} requires --crawl-links`));
 	}
-	if (options.errorFile) {
-		options.errorsFile = options.errorFile;
-		delete options.errorFile;
+	// the byte order mark is written by the CLI when the page is saved as HTML, and by the
+	// compression processor in the prelude of a self-extracting file — but a universal file
+	// declares a single-byte charset the mark would break, and an embedded image must start
+	// with the PNG signature, so there is nowhere left to write it
+	if (options.includeBOM && options.compressContent &&
+		(!options.selfExtractingArchive || options.extractDataFromPage || options.embeddedImage || options.embedScreenshot)) {
+		console.error("Warning: --include-bom is ignored, the file cannot start with a byte order mark. It requires --self-extracting-archive, --extract-data-from-page=false and no embedded image"); // eslint-disable-line no-console
 	}
-	if (options.errorTracesDisabled) {
-		options.errorsTracesDisabled = options.errorTracesDisabled;
-		delete options.errorTracesDisabled;
+	if (errorMessages.length) {
+		printUsage();
+		errorMessages.forEach(message => console.error(`Error: ${message}`)); // eslint-disable-line no-console
+		exit(1);
 	}
-	delete options.acceptHeaderFont;
-	delete options.acceptHeaderImage;
-	delete options.acceptHeaderStylesheet;
-	delete options.acceptHeaderScript;
-	delete options.acceptHeaderDocument;
-	return { ...options, url: positionals[0], output: positionals[1] };
+	return { ...options, url: urls[0], output: urls[1] };
 }
 
-function parseArgs(args) {
+function printUsage() {
+	console.log(USAGE_TEXT + "\n"); // eslint-disable-line no-console
+	console.log("Options:"); // eslint-disable-line no-console
+	OPTIONS_INFO.forEach(category => {
+		const categoryName = CATEGORIES[OPTIONS_INFO.indexOf(category)];
+		console.log(`  * ${categoryName}:`); // eslint-disable-line no-console
+		Object.keys(category).forEach(optionName => {
+			const optionInfo = category[optionName];
+			let optionType = optionInfo.type;
+			if (isArray(optionType)) {
+				optionType = optionType.replace("[]", "*");
+			}
+			const optionDescription = optionInfo.description;
+			const optionDefaultValue = optionInfo.defaultValue === undefined ? "" : `(default: ${JSON.stringify(optionInfo.defaultValue).replace(/[\u007f-\u009f]/g, character => "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0"))})`;
+			console.log(`    --${optionName}: ${optionDescription} <${optionType}> ${optionDefaultValue}`); // eslint-disable-line no-console
+		});
+		console.log(""); // eslint-disable-line no-console
+	});
+}
+
+function parseArgs(args, setDefaultValues = true) {
 	const positionals = [];
 	const options = {};
-	const result = { positionals, options: {} };
+	const invalidOptions = [];
+	const result = { positionals, options: {}, invalidOptions };
 	let argIndex = 0;
 	while (argIndex < args.length) {
 		const arg = args[argIndex];
-		const { argName, argValue, optionInfo } = parseArg(arg);
-		if (optionInfo) {
-			if (options[argName] === undefined) {
-				options[argName] = [];
+		const { argValue, option } = parseArg(arg);
+		if (option) {
+			const optionName = option.name;
+			if (options[optionName] === undefined) {
+				options[optionName] = [];
 			}
-			let nextArgName;
 			if (argValue === undefined) {
-				if (
-					argIndex + 1 < args.length &&
-					({ argName: nextArgName } = parseArg(args[argIndex + 1])) &&
-					(nextArgName === undefined || !getOptionInfo(nextArgName)) &&
-					isValid(optionInfo.type, args[argIndex + 1]) &&
-					(isArray(optionInfo.type) || !options[argName].length)) {
-					options[argName].push(args[argIndex + 1]);
-					argIndex++;
+				if (argIndex + 1 < args.length && !parseArg(args[argIndex + 1]).option) {
+					const nextArg = args[argIndex + 1];
+					if (isValid(option.info.type, nextArg)) {
+						options[optionName].push(nextArg);
+						argIndex++;
+					} else if (option.info.type.startsWith("number")) {
+						invalidOptions.push({ name: optionName, value: nextArg });
+						argIndex++;
+					}
 				}
-			} else if (isValid(optionInfo.type, argValue) && (isArray(optionInfo.type) || !options[argName].length)) {
-				options[argName].push(argValue);
+			} else if (isValid(option.info.type, argValue)) {
+				options[optionName].push(argValue);
 			} else {
-				positionals.push(arg);
+				invalidOptions.push({ name: optionName, value: argValue });
 			}
 		} else {
 			positionals.push(arg);
@@ -259,32 +430,166 @@ function parseArgs(args) {
 		argIndex++;
 	}
 	Object.keys(options).forEach(optionName => {
-		const optionInfo = getOptionInfo(optionName);
+		const optionInfo = getOptionInfo(optionName).info;
 		const optionKey = getOptionKey(optionName, optionInfo);
 		let optionValue = options[optionName];
 		const isArrayType = isArray(optionInfo.type);
+		if (!optionInfo.type.startsWith("boolean") && !optionValue.length &&
+			!invalidOptions.some(invalidOption => invalidOption.name == optionName)) {
+			invalidOptions.push({ name: optionName });
+		}
 		if (optionInfo.type.startsWith("boolean")) {
 			optionValue = optionValue.map(value => value == "true");
 			optionValue = isArrayType ?
 				optionValue.length ? optionValue : true :
-				optionValue.length ? optionValue[0] : true;
+				optionValue.length ? optionValue[optionValue.length - 1] : true;
 		} else if (optionInfo.type.startsWith("number")) {
 			optionValue = optionValue.map(value => Number(value));
 			optionValue = isArrayType ?
 				optionValue.length ? optionValue : optionInfo.defaultValue || 0 :
-				optionValue.length ? optionValue[0] : optionInfo.defaultValue || 0;
+				optionValue.length ? optionValue[optionValue.length - 1] : optionInfo.defaultValue || 0;
 		} else {
 			optionValue = isArrayType ?
 				optionValue.length ? optionValue : optionInfo.defaultValue || "" :
-				optionValue.length ? optionValue[0] : optionInfo.defaultValue || "";
+				optionValue.length ? optionValue[optionValue.length - 1] : optionInfo.defaultValue || "";
 		}
 		result.options[optionKey] = optionValue;
 	});
+	if (setDefaultValues) {
+		OPTIONS_INFO.forEach(categoryOptions => {
+			Object.keys(categoryOptions).forEach(optionName => {
+				const optionInfo = categoryOptions[optionName];
+				const optionKey = getOptionKey(optionName, optionInfo);
+				if (result.options[optionKey] === undefined && optionInfo.defaultValue !== undefined) {
+					result.options[optionKey] = optionInfo.defaultValue;
+				}
+			});
+		});
+	}
+	if (result.options.acceptHeaderFont ||
+		result.options.acceptHeaderImage ||
+		result.options.acceptHeaderStylesheet ||
+		result.options.acceptHeaderScript ||
+		result.options.acceptHeaderDocument) {
+		result.options.acceptHeaders = {
+			font: result.options.acceptHeaderFont,
+			image: result.options.acceptHeaderImage,
+			stylesheet: result.options.acceptHeaderStylesheet,
+			script: result.options.acceptHeaderScript,
+			document: result.options.acceptHeaderDocument
+		};
+		delete result.options.acceptHeaderFont;
+		delete result.options.acceptHeaderImage;
+		delete result.options.acceptHeaderStylesheet;
+		delete result.options.acceptHeaderScript;
+		delete result.options.acceptHeaderDocument;
+	}
+	if (result.options.browserArgs) {
+		const browserArguments = result.options.browserArguments || [];
+		try {
+			browserArguments.push(...JSON.parse(result.options.browserArgs));
+		} catch {
+			invalidOptions.push({ name: "browser-args", value: result.options.browserArgs });
+		}
+		result.options.browserArgs = browserArguments;
+		delete result.options.browserArguments;
+	}
+	if (result.options.browserArguments) {
+		result.options.browserArgs = result.options.browserArguments;
+		delete result.options.browserArguments;
+	}
+	if (result.options.errorFile !== undefined) {
+		result.options.errorsFile = result.options.errorFile;
+		delete result.options.errorFile;
+	}
+	if (result.options.errorTracesDisabled !== undefined) {
+		result.options.errorsTracesDisabled = result.options.errorTracesDisabled;
+		delete result.options.errorTracesDisabled;
+	}
+	if (result.options.browserRemoteDebuggingUrl !== undefined) {
+		result.options.browserServer = result.options.browserRemoteDebuggingUrl;
+		delete result.options.browserRemoteDebuggingUrl;
+	}
+	if (result.options.browserEngine !== undefined && !BROWSER_ENGINES.includes(result.options.browserEngine)) {
+		invalidOptions.push({ name: "browser-engine", value: result.options.browserEngine });
+	}
+	if (result.options.filenameReplacedCharacters) {
+		const filenameReplacedCharacters = result.options.filenameReplacedCharacters;
+		result.options.filenameReplacedCharacters = [];
+		result.options.filenameReplacementCharacters = [];
+		filenameReplacedCharacters.forEach(replacement => {
+			let [replacedCharacter, replacementCharacter] = replacement.split(" ");
+			try {
+				replacedCharacter = JSON.parse(replacedCharacter);
+				// eslint-disable-next-line no-unused-vars
+			} catch (_error) {
+				// ignored
+			}
+			result.options.filenameReplacedCharacters.push(replacedCharacter);
+			if (replacementCharacter !== undefined) {
+				try {
+					replacementCharacter = JSON.parse(replacementCharacter);
+					// eslint-disable-next-line no-unused-vars
+				} catch (_error) {
+					// ignored
+				}
+				result.options.filenameReplacementCharacters.push(replacementCharacter);
+			}
+		});
+	}
+	if (result.options.httpHeaders) {
+		const headers = {};
+		result.options.httpHeaders.forEach(header => {
+			const separatorIndex = header.indexOf("=");
+			if (separatorIndex <= 0) {
+				invalidOptions.push({ name: "http-header", value: header });
+			} else {
+				headers[header.substring(0, separatorIndex).trim()] = header.substring(separatorIndex + 1).trim();
+			}
+		});
+		result.options.httpHeaders = headers;
+	}
+	if (result.options.emulateMediaFeatures) {
+		result.options.emulateMediaFeatures = result.options.emulateMediaFeatures
+			.map(feature => {
+				const separatorIndex = feature.indexOf(":");
+				if (separatorIndex <= 0) {
+					invalidOptions.push({ name: "emulate-media-feature", value: feature });
+				} else {
+					return {
+						name: feature.substring(0, separatorIndex),
+						value: feature.substring(separatorIndex + 1)
+					};
+				}
+			})
+			.filter(feature => feature);
+	}
+	if (result.options.browserCookies) {
+		result.options.browserCookies = result.options.browserCookies.map(cookie => {
+			const [name, value, domain, path, expires, httpOnly, secure, sameSite, url] = cookie.split(",");
+			return {
+				name,
+				value,
+				url,
+				domain,
+				path,
+				secure: secure === "true",
+				httpOnly: httpOnly === "true",
+				sameSite,
+				expires: expires && !isNaN(Number(expires)) ? Number(expires) : undefined
+			};
+		});
+	}
 	return result;
 }
 
 function getOptionKey(optionKeyName, optionInfo) {
 	if (optionInfo) {
+		// option names are lowercase, the keys they fill are not always: the acronyms of
+		// "insertMetaCSP" and its kind cannot be derived from "insert-meta-csp", so they are declared
+		if (optionInfo.key) {
+			return optionInfo.key;
+		}
 		const optionName = optionInfo.alias || optionKeyName;
 		if (isArray(optionInfo.type)) {
 			return kebabToCamelCase(optionName + "s");
@@ -299,24 +604,28 @@ function parseArg(arg) {
 	const parsedArg = arg.match(ARGS_REGEX);
 	if (parsedArg && parsedArg.length) {
 		let [_, argName, argValue] = parsedArg; // eslint-disable-line no-unused-vars
-		const optionInfo = getOptionInfo(argName);
+		const option = getOptionInfo(argName);
 		if (argValue !== undefined &&
 			((argValue.startsWith("\"") && argValue.endsWith("\"")) ||
 				(argValue.startsWith("'") && argValue.endsWith("'")))) {
 			argValue = argValue.substring(1, argValue.length - 1);
 		}
-		return { argName, argValue, optionInfo };
+		return { argName, argValue, option };
 	} else {
 		return {};
 	}
 }
 
 function getOptionInfo(optionName) {
-	for (const keyName in OPTIONS_INFO) {
-		if (keyName.toLowerCase() == optionName.toLowerCase() || OPTIONS_INFO[keyName].alias == optionName.toLowerCase()) {
-			return OPTIONS_INFO[keyName];
-		}
-	}
+	let result;
+	OPTIONS_INFO.forEach(categoryOptions => {
+		Object.keys(categoryOptions).forEach(keyName => {
+			if (keyName.toLowerCase() == optionName.toLowerCase() || (categoryOptions[keyName].alias && categoryOptions[keyName].alias.toLowerCase() == optionName.toLowerCase())) {
+				result = { name: keyName, info: categoryOptions[keyName] };
+			}
+		});
+	});
+	return result;
 }
 
 function kebabToCamelCase(optionName) {
@@ -327,7 +636,7 @@ function isValid(type, value) {
 	if (type.startsWith("boolean")) {
 		return value == "true" || value == "false";
 	} else if (type.startsWith("number")) {
-		return !isNaN(value);
+		return value.trim() != "" && !isNaN(value);
 	} else {
 		return true;
 	}

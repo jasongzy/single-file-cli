@@ -2,15 +2,15 @@
 
 ## Introduction
 
-[SingleFile](https://github.com/gildas-lormeau/SingleFile) can be launched from the command line by running it into a (headless) browser. 
+[SingleFile](https://www.getsinglefile.com) can be launched from the command line by running it into a (headless) browser. 
 
-It runs through Deno as a standalone script injected into the web page via the Chrome DevTools Protocol instead of being embedded into a WebExtension.
+It runs through Deno as a standalone script injected into the web page via the Chrome DevTools Protocol, or via WebDriver BiDi when using Firefox, instead of being embedded into a WebExtension.
 
 ## Installation
 
 SingleFile can be run without installing it, just download the executable file and save it in the directory of your choice here: https://github.com/gildas-lormeau/single-file-cli/releases
 
-Make sure Chrome or a Chromium-based browser is installed in the default folder. Otherwise you might need to set the `--browser-executable-path` option to help SingleFile locating the path of the executable file.
+Make sure Chrome or a Chromium-based browser is installed in the default folder. Otherwise you might need to set the `--browser-executable-path` option to help SingleFile locating the path of the executable file. Firefox can be used instead by setting the `--browser-engine firefox` option, with some limitations described in the help.
 
 ## Installation with Docker
 
@@ -65,7 +65,7 @@ Make sure Chrome or a Chromium-based browser is installed in the default folder.
 
 - There are 3 ways to download the code of SingleFile, choose the one you prefer:
   
-  - Install with `npm` (`npm` is installed with Node.js) and run with `npx`
+  - Install with `npm` and run `single-file` via `npx` (`npm` and `npx` are installed with Node.js)
   
     ```sh
     npm install "single-file-cli"
@@ -124,6 +124,21 @@ Make sure Chrome or a Chromium-based browser is installed in the default folder.
   single-file https://www.wikipedia.org wikipedia.html
   ```
 
+  - Save a page needing a logged-in session. Create the profile first, log in
+    to the website in the browser window, and quit the browser to save it. Then
+    reuse the profile as many times as needed, it is copied and left unmodified.
+
+  ```sh
+  single-file --create-browser-profile ./profiles/example https://www.example.com/login
+  single-file https://www.example.com/account account.html --browser-profile=./profiles/example
+  ```
+
+  - Save https://www.wikipedia.org with Firefox
+
+  ```sh
+  single-file https://www.wikipedia.org wikipedia.html --browser-engine firefox
+  ```
+
   - Save a list of URLs stored into `list-urls.txt` in the current folder
 
   ```sh
@@ -142,6 +157,16 @@ Make sure Chrome or a Chromium-based browser is installed in the default folder.
   ```sh
   single-file https://www.wikipedia.org --crawl-links=true --crawl-inner-links-only=false --crawl-external-links-max-depth=1 --crawl-rewrite-rule="^.*wikipedia.*$"
   ```
+
+  - Save http://info.cern.ch (i.e. the first website) and its internal links into a single self-extracting ZIP file, and mark the links to pages missing from the archive
+
+  ```sh
+  single-file http://info.cern.ch first-website.html --crawl-links=true --crawl-max-depth=2 --crawl-save-archive=true --crawl-save-archive-mark-unarchived-links=true --compress-content=true
+  ```
+
+- Exit code
+
+  The exit code is 0 when all the pages have been saved, 1 when at least one capture failed (the other pages of the batch or the crawl are still saved), and 255 when an error prevented the process from running.
 
 ## Compile executables
 

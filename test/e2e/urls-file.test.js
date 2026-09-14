@@ -1,0 +1,67 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import process from "node:process";
+import { cliDirectory, fastCaptureArgs } from "../target.js";
+
+const execFileAsync = promisify(execFile);
+
+test("duplicate urls in a urls file are captured once", { timeout: 120000 }, async () => {
+	const server = createServer((_, response) => response
+		.writeHead(200, { "content-type": "text/html" })
+		.end("<html><head><title>Same Page</title></head><body>content</body></html>"));
+	await new Promise(resolve => server.listen(0, "localhost", resolve));
+	const directory = await mkdtemp(join(tmpdir(), "single-file-test-"));
+	try {
+		const url = "http://localhost:" + server.address().port + "/";
+		const urlsFilePath = join(directory, "urls.txt");
+		await writeFile(urlsFilePath, url + "\n\n" + url + "\n");
+		const { stderr } = await execFileAsync(process.execPath, [
+			"single-file-node.js", ...fastCaptureArgs,
+			"--urls-file", urlsFilePath,
+			"--output-directory", directory,
+			"--filename-template", "{page-title}.html"
+		], { cwd: cliDirectory });
+		const files = (await readdir(directory)).filter(file => file.endsWith(".html"));
+		assert.deepEqual(files, ["Same Page.html"], "stderr: " + stderr);
+	} finally {
+		await rm(directory, { recursive: true });
+		server.close();
+	}
+});
+
+test("a failed capture in a urls file batch sets a nonzero exit code without aborting the batch", { timeout: 120000 }, async () => {
+	const server = createServer((_, response) => response
+		.writeHead(200, { "content-type": "text/html" })
+		.end("<html><head><title>Good Page</title></head><body>content</body></html>"));
+	await new Promise(resolve => server.listen(0, "localhost", resolve));
+	const directory = await mkdtemp(join(tmpdir(), "single-file-test-"));
+	try {
+		const goodUrl = "http://localhost:" + server.address().port + "/";
+		const urlsFilePath = join(directory, "urls.txt");
+		await writeFile(urlsFilePath, "http://localhost:1/\n" + goodUrl + "\n");
+		let exitCode = 0, stderr = "";
+		try {
+			({ stderr } = await execFileAsync(process.execPath, [
+				"single-file-node.js", ...fastCaptureArgs,
+				"--urls-file", urlsFilePath,
+				"--output-directory", directory,
+				"--filename-template", "{page-title}.html"
+			], { cwd: cliDirectory }));
+		} catch (error) {
+			exitCode = error.code;
+			stderr = error.stderr;
+		}
+		assert.equal(exitCode, 1);
+		const files = (await readdir(directory)).filter(file => file.endsWith(".html"));
+		assert.deepEqual(files, ["Good Page.html"], "stderr: " + stderr);
+	} finally {
+		await rm(directory, { recursive: true });
+		server.close();
+	}
+});
